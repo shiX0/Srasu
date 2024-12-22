@@ -28,7 +28,7 @@ SRASU implementations for spatial reconstruction and scene understanding, specif
 
 ## Team Members
 
-- Aasista Karki
+- Aashista Karki
 - Shishir Sharma
 
 ## Contact
