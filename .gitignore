@@ -1,6 +1,10 @@
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
+output/
+slam_output/
+kitti_dataset/
+
 *.py[cod]
 *$py.class
 
