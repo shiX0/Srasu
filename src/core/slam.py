@@ -4,6 +4,7 @@ from typing import Tuple, List, Optional
 import logging
 import datetime
 import os
+from .visual3d import Visualizer3D
 
 
 class ORBSLAM:
@@ -18,6 +19,9 @@ class ORBSLAM:
         self.camera_index = camera_index
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+
+        # Initialize 3D visualizer first
+        self.visualizer = Visualizer3D(use_gpu=True)
 
         # Initialize logging
         self.setup_logging()
@@ -51,9 +55,9 @@ class ORBSLAM:
         self.frame_poses = []
 
         # Camera parameters (should be calibrated)
-        self.K = np.array([[1000, 0, 320],
-                          [0, 1000, 240],
-                          [0, 0, 1]], dtype=np.float32)
+        self.K = np.array([[718.856, 0, 607.1928],
+                          [0, 718.856, 185.2157],
+                          [0, 0, 1]], dtype=np.float32)  # KITTI camera parameters
         self.dist_coeffs = np.zeros((4, 1))
 
         # Track quality metrics
@@ -63,6 +67,8 @@ class ORBSLAM:
 
         # Frame counter
         self.frame_count = 0
+
+        self.logger.info("SLAM system initialized successfully")
 
     def setup_logging(self):
         """Configure logging system"""
@@ -98,6 +104,7 @@ class ORBSLAM:
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
+        self.visualizer.close()
         self.logger.info("Camera released and windows closed")
 
     def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -166,68 +173,6 @@ class ORBSLAM:
             self.logger.warning(f"Feature matching failed: {str(e)}")
             return []
 
-    def extract_point_cloud(self, matches: List, keypoints1: List, keypoints2: List) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract 3D points from matched features
-
-        Args:
-            matches (List): Feature matches
-            keypoints1 (List): Keypoints from first frame
-            keypoints2 (List): Keypoints from second frame
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector
-        """
-        try:
-            if len(matches) < 8:
-                return np.eye(3), np.zeros((3, 1))
-
-            # Extract matched points
-            points1 = np.float32([keypoints1[m.queryIdx].pt for m in matches])
-            points2 = np.float32([keypoints2[m.trainIdx].pt for m in matches])
-
-            # Normalize points
-            points1_norm = cv2.undistortPoints(
-                points1.reshape(-1, 1, 2), self.K, self.dist_coeffs)
-            points2_norm = cv2.undistortPoints(
-                points2.reshape(-1, 1, 2), self.K, self.dist_coeffs)
-
-            # Find essential matrix
-            E, mask = cv2.findEssentialMat(
-                points1_norm,
-                points2_norm,
-                focal=1.0,
-                pp=(0., 0.),
-                method=cv2.RANSAC,
-                prob=0.999,
-                threshold=0.001
-            )
-
-            if E is None or E.shape != (3, 3):
-                return np.eye(3), np.zeros((3, 1))
-
-            # Recover pose
-            _, R, t, mask = cv2.recoverPose(
-                E, points1_norm, points2_norm, mask=mask)
-
-            # Triangulate points
-            proj1 = np.hstack((np.eye(3), np.zeros((3, 1))))
-            proj2 = np.hstack((R, t))
-
-            points4D = cv2.triangulatePoints(
-                proj1, proj2, points1_norm, points2_norm)
-            points3D = points4D[:3] / points4D[3]
-
-            # Store 3D points
-            valid_points = points3D.T[mask.ravel() == 1]
-            if len(valid_points) > 0:
-                self.point_cloud.extend(valid_points)
-
-            return R, t
-        except Exception as e:
-            self.logger.error(f"Point cloud extraction failed: {str(e)}")
-            return np.eye(3), np.zeros((3, 1))
-
     def process_frame(self, frame: np.ndarray):
         """
         Process a single frame
@@ -248,45 +193,136 @@ class ORBSLAM:
                     self.prev_descriptors, descriptors)
 
                 if len(matches) > self.min_matches:
-                    # Update tracking quality
-                    self.last_tracking_quality = len(matches) / len(keypoints)
-
-                    # Visualize matches
-                    img_matches = cv2.drawMatches(
-                        self.prev_frame,
-                        self.prev_keypoints,
-                        processed_frame,
-                        keypoints,
-                        matches[:100],
-                        None,
-                        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-                    )
-                    cv2.imshow('Feature Matching', img_matches)
-
-                    # Extract point cloud
+                    # Extract point cloud and camera pose
                     R, t = self.extract_point_cloud(
                         matches, self.prev_keypoints, keypoints)
 
                     # Update camera position
-                    if len(self.camera_positions) == 0:
-                        self.camera_positions.append(np.zeros(3))
+                    if len(self.camera_positions) > 0:
+                        last_pos = self.camera_positions[-1]
+                        new_pos = last_pos + R @ t.ravel()
                     else:
-                        new_pos = self.camera_positions[-1] + R.T @ t.ravel()
-                        self.camera_positions.append(new_pos)
+                        new_pos = np.zeros(3)
+                    self.camera_positions.append(new_pos)
 
-                    # Save frame pose
-                    self.frame_poses.append((R, t))
+                    # Get detected objects from the frame
+                    objects_3d = []
+                    if hasattr(frame, 'detected_objects'):
+                        for obj in frame.detected_objects:
+                            # Convert 2D bbox to 3D
+                            center_3d = np.array([
+                                obj['bbox'][0] + obj['bbox'][2]/2,
+                                obj['bbox'][1] + obj['bbox'][3]/2,
+                                0
+                            ])
+                            size_3d = np.array([
+                                obj['bbox'][2],
+                                obj['bbox'][3],
+                                2.0
+                            ])
+                            objects_3d.append({
+                                'center': center_3d,
+                                'size': size_3d,
+                                'type': obj.get('type', 'unknown')
+                            })
+
+                    # Detect lanes
+                    lane_mask = self.detect_lanes(frame)
+                    lane_points = []
+                    if lane_mask is not None:
+                        # Convert lane mask to 3D points
+                        lane_y, lane_x = np.where(lane_mask > 0)
+                        if len(lane_x) > 0:
+                            # Project lane points to 3D
+                            lane_points_2d = np.column_stack([lane_x, lane_y])
+                            lane_points_norm = cv2.undistortPoints(
+                                lane_points_2d.reshape(-1, 1, 2),
+                                self.K,
+                                self.dist_coeffs
+                            ).reshape(-1, 2)
+
+                            # Assume lanes are on the ground plane (z=0)
+                            lane_points = np.column_stack([
+                                lane_points_norm * 5.0,  # Scale for better visibility
+                                np.zeros(len(lane_points_norm))
+                            ])
+
+                    # Update point cloud visualization if we have enough points
+                    if len(self.point_cloud) > 100:
+                        points = np.array(self.point_cloud)
+                        # Update the entire 3D scene
+                        self.visualizer.update_scene(
+                            points=points,
+                            objects=objects_3d,
+                            camera_pos=new_pos,
+                            lane_points=lane_points if len(
+                                lane_points) > 0 else None
+                        )
+
+                    # Draw matches on frame for visualization
+                    vis_frame = cv2.drawMatches(
+                        self.prev_frame, self.prev_keypoints,
+                        processed_frame, keypoints,
+                        matches[:100], None,
+                        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                    )
+                    cv2.imshow('Feature Matching', vis_frame)
 
             # Update previous frame data
             self.prev_frame = processed_frame
             self.prev_keypoints = keypoints
             self.prev_descriptors = descriptors
-
-            # Increment frame counter
             self.frame_count += 1
 
         except Exception as e:
             self.logger.error(f"Frame processing failed: {str(e)}")
+
+    def detect_lanes(self, frame: np.ndarray) -> np.ndarray:
+        """Detect lanes in the frame"""
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Apply Gaussian blur
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            # Apply Canny edge detection
+            edges = cv2.Canny(blurred, 50, 150)
+
+            # Create ROI mask
+            height, width = edges.shape
+            mask = np.zeros_like(edges)
+            roi_vertices = np.array([
+                [(0, height),
+                 (width * 0.45, height * 0.6),
+                 (width * 0.55, height * 0.6),
+                 (width, height)]
+            ], dtype=np.int32)
+            cv2.fillPoly(mask, roi_vertices, 255)
+            masked_edges = cv2.bitwise_and(edges, mask)
+
+            # Detect lines using HoughLinesP
+            lines = cv2.HoughLinesP(
+                masked_edges,
+                rho=1,
+                theta=np.pi/180,
+                threshold=50,
+                minLineLength=height * 0.3,
+                maxLineGap=height * 0.05
+            )
+
+            # Create lane mask
+            lane_mask = np.zeros_like(frame)
+            if lines is not None:
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    cv2.line(lane_mask, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+            return lane_mask[:, :, 0]  # Return single channel
+
+        except Exception as e:
+            self.logger.error(f"Lane detection failed: {str(e)}")
+            return None
 
     def filter_point_cloud(self, points: np.ndarray) -> np.ndarray:
         """
@@ -375,6 +411,87 @@ class ORBSLAM:
         except Exception as e:
             self.logger.error(f"Failed to save PLY file: {str(e)}")
 
+    def extract_point_cloud(self, matches: List, keypoints1: List, keypoints2: List) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract 3D points from matched features with improved accuracy
+
+        Args:
+            matches (List): Feature matches
+            keypoints1 (List): Keypoints from first frame
+            keypoints2 (List): Keypoints from second frame
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: Rotation matrix and translation vector
+        """
+        try:
+            if len(matches) < 8:
+                return np.eye(3), np.zeros((3, 1))
+
+            # Extract matched points
+            points1 = np.float32([keypoints1[m.queryIdx].pt for m in matches])
+            points2 = np.float32([keypoints2[m.trainIdx].pt for m in matches])
+
+            # Normalize points
+            points1_norm = cv2.undistortPoints(
+                points1.reshape(-1, 1, 2), self.K, self.dist_coeffs)
+            points2_norm = cv2.undistortPoints(
+                points2.reshape(-1, 1, 2), self.K, self.dist_coeffs)
+
+            # Find essential matrix with stricter RANSAC parameters
+            E, mask = cv2.findEssentialMat(
+                points1_norm, points2_norm,
+                focal=1.0, pp=(0., 0.),
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=0.0003  # Stricter threshold
+            )
+
+            if E is None or E.shape != (3, 3):
+                return np.eye(3), np.zeros((3, 1))
+
+            # Recover pose with more accurate parameters
+            _, R, t, mask = cv2.recoverPose(
+                E, points1_norm, points2_norm, mask=mask)
+
+            # Triangulate points with better accuracy
+            proj1 = np.hstack((np.eye(3), np.zeros((3, 1))))
+            proj2 = np.hstack((R, t))
+
+            # Scale matrices appropriately
+            proj1 = self.K @ proj1
+            proj2 = self.K @ proj2
+
+            points4D = cv2.triangulatePoints(proj1, proj2, points1, points2)
+            points3D = points4D[:3] / points4D[3]
+
+            # Filter points based on reprojection error
+            max_error = 2.0  # pixels
+            valid_points = []
+            for i, point3D in enumerate(points3D.T):
+                if mask[i]:
+                    # Project point back to both images
+                    proj1_point = proj1 @ np.append(point3D, 1)
+                    proj2_point = proj2 @ np.append(point3D, 1)
+
+                    proj1_point = proj1_point[:2] / proj1_point[2]
+                    proj2_point = proj2_point[:2] / proj2_point[2]
+
+                    error1 = np.linalg.norm(proj1_point - points1[i])
+                    error2 = np.linalg.norm(proj2_point - points2[i])
+
+                    if error1 < max_error and error2 < max_error:
+                        valid_points.append(point3D)
+
+            # Store filtered 3D points
+            if len(valid_points) > 0:
+                self.point_cloud.extend(valid_points)
+
+            return R, t
+
+        except Exception as e:
+            self.logger.error(f"Point cloud extraction failed: {str(e)}")
+            return np.eye(3), np.zeros((3, 1))
+
     def run(self):
         """Run the SLAM system"""
         self.logger.info("Starting SLAM system")
@@ -394,7 +511,12 @@ class ORBSLAM:
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.imshow('Frame', frame)
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                # Update 3D visualization
+                if self.visualizer.update_visualization():
+                    break  # Break if visualization window is closed
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
 
                 # Auto-save periodically
