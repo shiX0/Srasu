@@ -5,7 +5,6 @@ from typing import Tuple, List, Dict
 import os
 from ultralytics import YOLO
 import torch
-import time
 
 
 class AutonomousPerception:
@@ -283,139 +282,203 @@ class AutonomousPerception:
 
         return points3D
 
-    def create_3d_bounding_box(self, bbox: List[int], obj_type: str, color: tuple) -> o3d.geometry.LineSet:
-        """Create a 3D bounding box using Open3D"""
-        x1, y1, x2, y2 = bbox
-
-        # Get object dimensions based on type (in meters)
-        if obj_type in ['car', 'bus', 'truck']:
-            width = 2.0
-            height = 1.6
-            length = 4.0
-        elif obj_type == 'person':
-            width = 0.6
-            height = 1.8
-            length = 0.6
-        else:  # signs and other objects
-            width = 0.8
-            height = 0.8
-            length = 0.3
-
-        # Calculate object position in 3D space
-        # Convert image coordinates to 3D world coordinates
-        # Approximate image height
-        image_height = self.camera_intrinsics[1, 2] * 2
-        depth = 30 * (1 - y2 / image_height)  # Depth estimation
-
-        # Use camera intrinsics to get 3D position
-        center_x = (
-            (x1 + x2) / 2 - self.camera_intrinsics[0, 2]) * depth / self.camera_intrinsics[0, 0]
-        center_y = (
-            (y1 + y2) / 2 - self.camera_intrinsics[1, 2]) * depth / self.camera_intrinsics[1, 1]
-        center_z = depth
-
-        # Create box vertices
-        vertices = [
-            [center_x - width/2, center_y - height/2,
-                center_z - length/2],  # Front bottom left
-            [center_x + width/2, center_y - height/2,
-                center_z - length/2],  # Front bottom right
-            [center_x + width/2, center_y + height/2,
-                center_z - length/2],  # Front top right
-            [center_x - width/2, center_y + height/2,
-                center_z - length/2],  # Front top left
-            [center_x - width/2, center_y - height/2,
-                center_z + length/2],  # Back bottom left
-            [center_x + width/2, center_y - height/2,
-                center_z + length/2],  # Back bottom right
-            [center_x + width/2, center_y + height/2,
-                center_z + length/2],  # Back top right
-            [center_x - width/2, center_y + height/2,
-                center_z + length/2]   # Back top left
-        ]
-
-        # Define edges connecting vertices
-        lines = [
-            [0, 1], [1, 2], [2, 3], [3, 0],  # Front face
-            [4, 5], [5, 6], [6, 7], [7, 4],  # Back face
-            [0, 4], [1, 5], [2, 6], [3, 7]   # Connecting lines
-        ]
-
-        # Create Open3D LineSet
-        line_set = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(vertices),
-            lines=o3d.utility.Vector2iVector(lines)
-        )
-
-        # Set color (convert from BGR to RGB)
-        rgb_color = (color[2]/255, color[1]/255, color[0]/255)
-        line_set.paint_uniform_color(rgb_color)
-
-        return line_set
-
     def init_3d_visualization(self):
-        """Initialize visualization windows and Open3D visualizer"""
+        """Initialize visualization windows and position them"""
         try:
-            # Create OpenCV windows
-            screen_width = 1920  # Default resolution
+            # Get screen resolution
+            screen_width = 1920  # Default resolution, adjust if needed
             screen_height = 1080
-            window_width = screen_width // 2
-            window_height = screen_height // 2
 
+            # Create windows
             cv2.namedWindow("Autonomous Vehicle View", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Matching", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Info View", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("SLAM Visualization", cv2.WINDOW_NORMAL)
 
-            # Position OpenCV windows
+            # Set window sizes (each taking a quarter of the screen)
+            window_width = screen_width // 2
+            window_height = screen_height // 2
+
+            # Position windows in corners
             cv2.resizeWindow("Autonomous Vehicle View",
                              window_width, window_height)
             cv2.resizeWindow("Feature Matching", window_width, window_height)
             cv2.resizeWindow("Info View", window_width, window_height)
+            cv2.resizeWindow("SLAM Visualization", window_width, window_height)
 
+            # Top-left corner
             cv2.moveWindow("Autonomous Vehicle View", 0, 0)
+            # Top-right corner
             cv2.moveWindow("Feature Matching", window_width, 0)
+            # Bottom-left corner
             cv2.moveWindow("Info View", 0, window_height)
-
-            # Initialize Open3D visualizer
-            self.vis = o3d.visualization.Visualizer()
-            self.vis.create_window(
-                "3D Scene", width=window_width, height=window_height)
-
-            # Set up initial view
-            view_control = self.vis.get_view_control()
-            view_control.set_zoom(0.3)
-            view_control.set_front([0, 0, -1])
-            view_control.set_up([0, -1, 0])
-
-            # Add coordinate frame
-            coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-                size=2.0)
-            self.vis.add_geometry(coordinate_frame)
-
-            # Create ground plane
-            self.create_ground_plane()
+            # Bottom-right corner
+            cv2.moveWindow("SLAM Visualization", window_width, window_height)
 
             self.use_3d_vis = True
-            print("3D visualization initialized successfully")
+            print("Visualization initialized successfully")
 
-            # Initialize tracking variables
-            self.current_geometries = {}  # Track current objects in scene
-            self.last_update_time = time.time()
+            # Initialize SLAM visualization elements
+            self.slam_points = []
+            self.camera_trajectory = []
+            self.current_pose = np.eye(4)
+            self.slam_colors = []
 
         except Exception as e:
             print(f"\nError initializing visualization: {str(e)}")
             self.use_3d_vis = False
 
-    def create_ground_plane(self):
-        """Create and add ground plane to visualizer"""
-        # Create ground plane mesh
-        plane_mesh = o3d.geometry.TriangleMesh.create_box(40, 0.1, 40)
-        plane_mesh.translate([-20, -0.05, -20])  # Center the plane
-        plane_mesh.paint_uniform_color([0.2, 0.2, 0.2])  # Dark gray
+    def update_slam_visualization(self, points_3d: np.ndarray, R: np.ndarray, t: np.ndarray):
+        """Update SLAM visualization to match reference style"""
+        try:
+            # Create black background
+            vis_img = np.zeros((800, 800, 3), dtype=np.uint8)
 
-        # Add to visualizer
-        self.vis.add_geometry(plane_mesh)
-        self.ground_plane = plane_mesh
+            # Default scale and center values
+            scale = 50.0
+            x_center = 0
+            z_center = 0
+
+            # Update camera trajectory
+            if R is not None and t is not None:
+                # Update current pose with scale factor for better visualization
+                transform = np.eye(4)
+                transform[:3, :3] = R
+                # Scale up translation for better visibility
+                transform[:3, 3] = t.ravel() * 5
+                self.current_pose = self.current_pose @ transform
+
+                # Add camera position if movement is significant
+                if np.linalg.norm(t) > 0.01:  # Minimum movement threshold
+                    self.camera_trajectory.append(self.current_pose[:3, 3])
+
+            # Process new 3D points
+            if points_3d is not None and len(points_3d) > 0:
+                valid_points = []
+                for point in points_3d:
+                    # Stricter filtering for better point cloud quality
+                    if (np.all(np.isfinite(point)) and
+                        np.linalg.norm(point) < 100 and  # Increased range
+                            abs(point[1]) < 20):  # Increased height range
+                        # Transform point to world coordinates
+                        world_point = self.current_pose[:3,
+                                                        :3] @ point + self.current_pose[:3, 3]
+                        valid_points.append(world_point)
+                        # Color based on height (green gradient)
+                        height_norm = np.clip((world_point[1] + 20) / 40, 0, 1)
+                        self.slam_colors.append([0, int(255 * height_norm), 0])
+
+                self.slam_points.extend(valid_points)
+
+            # Keep only recent points for better visualization
+            max_points = 50000  # Increased point limit
+            if len(self.slam_points) > max_points:
+                self.slam_points = self.slam_points[-max_points:]
+                self.slam_colors = self.slam_colors[-max_points:]
+
+            if len(self.slam_points) > 0:
+                points = np.array(self.slam_points)
+
+                # Dynamic scale calculation
+                x_spread = np.ptp(points[:, 0])
+                z_spread = np.ptp(points[:, 2])
+                if x_spread > 0 and z_spread > 0:
+                    scale = min(700 / max(x_spread, z_spread, 1),
+                                200)  # Increased max scale
+
+                # Center calculation using percentile for robustness
+                x_center = np.percentile(points[:, 0], 50)
+                z_center = np.percentile(points[:, 2], 50)
+
+                # Project points to 2D
+                points_2d = points[:, [0, 2]]
+                points_2d[:, 0] = (points_2d[:, 0] - x_center) * scale + 400
+                points_2d[:, 1] = (points_2d[:, 1] - z_center) * scale + 400
+                points_2d = np.clip(points_2d, 0, 799).astype(np.int32)
+
+                # Draw points with increased density
+                for pt, color in zip(points_2d, self.slam_colors):
+                    cv2.circle(vis_img, tuple(pt), 1, color, -1)
+
+                # Draw trajectory
+                if len(self.camera_trajectory) > 1:
+                    trajectory = np.array(self.camera_trajectory)
+                    traj_2d = trajectory[:, [0, 2]]
+                    traj_2d[:, 0] = (traj_2d[:, 0] - x_center) * scale + 400
+                    traj_2d[:, 1] = (traj_2d[:, 1] - z_center) * scale + 400
+                    traj_2d = np.clip(traj_2d, 0, 799).astype(np.int32)
+
+                    # Draw trajectory line in red
+                    for i in range(len(traj_2d) - 1):
+                        cv2.line(vis_img, tuple(traj_2d[i]), tuple(traj_2d[i + 1]),
+                                 (0, 0, 255), 2)
+
+            # Add grid (fainter than in original)
+            grid_spacing = 50
+            grid_color = (20, 20, 20)  # Darker grid
+            for i in range(0, 800, grid_spacing):
+                cv2.line(vis_img, (i, 0), (i, 800), grid_color, 1)
+                cv2.line(vis_img, (0, i), (800, i), grid_color, 1)
+
+            # Add information overlay (matching reference style)
+            cv2.putText(vis_img, f"Points: {len(self.slam_points)}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(vis_img, f"Scale: {10/scale:.1f}m/pixel", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # Add orientation compass (smaller and more subtle)
+            compass_center = (750, 50)
+            compass_size = 20
+            cv2.circle(vis_img, compass_center, compass_size, (50, 50, 50), 1)
+            cv2.line(vis_img, compass_center,
+                     (compass_center[0], compass_center[1] - compass_size), (0, 0, 255), 1)
+            cv2.putText(vis_img, "N", (compass_center[0] - 5, compass_center[1] - compass_size - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Show visualization
+            cv2.imshow("SLAM Visualization", vis_img)
+
+        except Exception as e:
+            print(f"Warning: SLAM visualization failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def create_ground_plane(self):
+        """Create road surface with lane markings"""
+        # Create road surface (darker for better contrast)
+        road_width = 20
+        road_length = 40
+        plane_mesh = o3d.geometry.TriangleMesh.create_box(
+            road_width, road_length, 0.01)
+        plane_mesh.paint_uniform_color([0.2, 0.2, 0.2])  # Dark gray road
+        plane_mesh.translate([-road_width/2, 0, -0.005])  # Center the road
+
+        # Create lane marking lines
+        grid_lines = []
+
+        # Center line (double yellow)
+        for offset in [-0.1, 0.1]:  # Two lines for center
+            points = [[offset, 0, 0], [offset, road_length, 0]]
+            lines = [[0, 1]]
+            line_set = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(points),
+                lines=o3d.utility.Vector2iVector(lines))
+            line_set.paint_uniform_color([1, 1, 0])  # Yellow
+            grid_lines.append(line_set)
+
+        # Side lanes (white dashed)
+        for x in [-3, 3]:  # Left and right lanes
+            for y in range(0, road_length, 2):  # Dashed lines
+                if y % 4 < 2:  # Create gaps
+                    points = [[x, y, 0], [x, y + 2, 0]]
+                    lines = [[0, 1]]
+                    line_set = o3d.geometry.LineSet(
+                        points=o3d.utility.Vector3dVector(points),
+                        lines=o3d.utility.Vector2iVector(lines))
+                    line_set.paint_uniform_color([1, 1, 1])  # White
+                    grid_lines.append(line_set)
+
+        self.ground_plane = {"mesh": plane_mesh, "grid": grid_lines}
 
     def detect_objects(self, frame: np.ndarray) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """Detect objects using YOLOv8n with speed optimizations"""
@@ -517,70 +580,44 @@ class AutonomousPerception:
     def update_visualization(self, frame: np.ndarray, points_3d: np.ndarray,
                              lane_mask: np.ndarray, vehicles: List[Dict],
                              pedestrians: List[Dict], signs: List[Dict]):
-        """Update visualization with dynamic 3D bounding boxes"""
+        """Update visualization with speed optimizations"""
         if not self.use_3d_vis:
             return
 
         try:
-            # Update 2D visualization
+            # Create a copy of the frame for visualization
             vis_frame = frame.copy()
             height, width = frame.shape[:2]
 
-            # Draw detected lanes and corridor
+            # Draw detected lanes with transparency
             if lane_mask is not None:
                 cv2.addWeighted(lane_mask, 0.4, vis_frame, 1, 0, vis_frame)
+
+            # Draw driving corridor
             if hasattr(self, 'corridor_points'):
+                # Simplified corridor visualization
                 overlay = vis_frame.copy()
                 cv2.fillPoly(overlay, self.corridor_points, (0, 255, 0))
                 cv2.addWeighted(overlay, 0.2, vis_frame, 0.8, 0, vis_frame)
 
-            # Update 3D visualization
-            # Clear previous objects
-            for obj_id in list(self.current_geometries.keys()):
-                self.vis.remove_geometry(
-                    self.current_geometries[obj_id], False)
-            self.current_geometries.clear()
-
-            # Sort objects by distance
-            all_objects = vehicles + pedestrians + signs
-            all_objects.sort(key=lambda x: x['bbox'][3], reverse=True)
-
-            # Process each object
-            for i, obj in enumerate(all_objects):
+            # Draw objects with simplified 3D visualization
+            for obj in vehicles + pedestrians + signs:
                 bbox = obj['bbox']
-                color = obj['color']
-                obj_type = obj['type']
-
-                # Draw 2D bounding box and label
                 x1, y1, x2, y2 = [int(x) for x in bbox]
+                color = obj['color']
+
+                # Simple box with minimal 3D effect
                 cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
 
+                # Distance estimation
                 distance = 30 * (1 - y2 / height)
-                label = f"{obj_type}: {distance:.1f}m"
+
+                # Simplified label
+                label = f"{obj['type']}: {distance:.1f}m"
                 cv2.putText(vis_frame, label, (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                # Create and add 3D bounding box
-                box_3d = self.create_3d_bounding_box(bbox, obj_type, color)
-                self.vis.add_geometry(box_3d, False)
-                self.current_geometries[f"obj_{i}"] = box_3d
-
-            # Update point cloud if available
-            if points_3d is not None and len(points_3d) > 0:
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(points_3d)
-                pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Light gray
-                self.vis.add_geometry(pcd, False)
-                self.current_geometries["point_cloud"] = pcd
-
-            # Update Open3D visualization
-            self.vis.poll_events()
-            self.vis.update_renderer()
-
-            # Show 2D visualizations
-            cv2.imshow("Autonomous Vehicle View", vis_frame)
-
-            # Add stats overlay
+            # Simplified stats display
             cv2.putText(vis_frame, f"Vehicles: {len(vehicles)}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
             cv2.putText(vis_frame, f"People: {len(pedestrians)}", (10, 50),
@@ -588,10 +625,11 @@ class AutonomousPerception:
             cv2.putText(vis_frame, f"Signs: {len(signs)}", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
+            # Show the visualization
+            cv2.imshow("Autonomous Vehicle View", vis_frame)
+
         except Exception as e:
             print(f"\nWarning: Visualization update failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
             self.use_3d_vis = False
 
     def process_frame(self, frame: np.ndarray):
@@ -631,12 +669,15 @@ class AutonomousPerception:
                 points_3d = self.triangulate_points(
                     self.prev_keypoints, keypoints, good_matches, R, t)
 
+                # Update SLAM visualization
+                self.update_slam_visualization(points_3d, R, t)
+
         # Update previous frame data
         self.prev_frame = frame.copy()
         self.prev_keypoints = keypoints
         self.prev_descriptors = descriptors
 
-        # Update visualization with all detections and SLAM data
+        # Update visualization with all detections
         self.update_visualization(
             frame, points_3d, lane_mask, vehicles, pedestrians, signs)
 
