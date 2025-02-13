@@ -5,6 +5,7 @@ from typing import Tuple, List, Dict
 import os
 from ultralytics import YOLO
 import torch
+from .depth_estimation import DepthEstimator
 
 
 class AutonomousPerception:
@@ -23,6 +24,9 @@ class AutonomousPerception:
                 print("Using CPU for detection")
                 self.device = 'cpu'
 
+            # Initialize depth estimator
+            self.depth_estimator = DepthEstimator()
+
             # Optimize parameters for speed
             self.detector.conf = 0.35  # Higher confidence threshold to reduce false positives
             self.detector.iou = 0.35   # Lower IoU for faster NMS
@@ -31,8 +35,8 @@ class AutonomousPerception:
             self.detector.verbose = False  # Disable verbose output
 
         except Exception as e:
-            print(f"Error loading YOLO model: {str(e)}")
-            print("Please install ultralytics: pip install ultralytics")
+            print(f"Error loading models: {str(e)}")
+            print("Please install required packages: pip install ultralytics torch")
             raise
 
         # Camera parameters
@@ -294,26 +298,25 @@ class AutonomousPerception:
             cv2.namedWindow("Feature Matching", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Info View", cv2.WINDOW_NORMAL)
             cv2.namedWindow("SLAM Visualization", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Depth Map", cv2.WINDOW_NORMAL)
 
-            # Set window sizes (each taking a quarter of the screen)
-            window_width = screen_width // 2
+            # Set window sizes (each taking a portion of the screen)
+            window_width = screen_width // 3
             window_height = screen_height // 2
 
-            # Position windows in corners
-            cv2.resizeWindow("Autonomous Vehicle View",
-                             window_width, window_height)
+            # Position windows in grid layout
+            cv2.resizeWindow("Autonomous Vehicle View", window_width, window_height)
             cv2.resizeWindow("Feature Matching", window_width, window_height)
             cv2.resizeWindow("Info View", window_width, window_height)
             cv2.resizeWindow("SLAM Visualization", window_width, window_height)
+            cv2.resizeWindow("Depth Map", window_width, window_height)
 
-            # Top-left corner
+            # Position windows in a 2x3 grid
             cv2.moveWindow("Autonomous Vehicle View", 0, 0)
-            # Top-right corner
             cv2.moveWindow("Feature Matching", window_width, 0)
-            # Bottom-left corner
-            cv2.moveWindow("Info View", 0, window_height)
-            # Bottom-right corner
-            cv2.moveWindow("SLAM Visualization", window_width, window_height)
+            cv2.moveWindow("Info View", 2 * window_width, 0)
+            cv2.moveWindow("SLAM Visualization", 0, window_height)
+            cv2.moveWindow("Depth Map", window_width, window_height)
 
             self.use_3d_vis = True
             print("Visualization initialized successfully")
@@ -637,8 +640,26 @@ class AutonomousPerception:
         # Detect lanes
         lane_mask = self.detect_lanes(frame)
 
+        # Extract lane information for 3D visualization
+        lane_info = self.extract_lane_info(lane_mask)
+
         # Detect objects
         vehicles, pedestrians, signs = self.detect_objects(frame)
+
+        # Combine all detected objects
+        detected_objects = []
+        for v in vehicles:
+            v['type'] = 'car'
+            detected_objects.append(v)
+        for p in pedestrians:
+            p['type'] = 'person'
+            detected_objects.append(p)
+        for s in signs:
+            s['type'] = 'sign'
+            detected_objects.append(s)
+
+        # Estimate depth
+        depth_map, colored_depth = self.depth_estimator.estimate_depth(frame)
 
         # Detect features and estimate motion
         keypoints, descriptors = self.detect_features(frame)
@@ -665,6 +686,9 @@ class AutonomousPerception:
                 R, t = self.estimate_motion(
                     self.prev_keypoints, keypoints, good_matches)
 
+                # Update ego vehicle pose for 3D visualization
+                self.depth_estimator.update_pose(R, t)
+
                 # Triangulate points
                 points_3d = self.triangulate_points(
                     self.prev_keypoints, keypoints, good_matches, R, t)
@@ -677,15 +701,23 @@ class AutonomousPerception:
         self.prev_keypoints = keypoints
         self.prev_descriptors = descriptors
 
-        # Update visualization with all detections
+        # Update visualization with all detections and lane guidance
         self.update_visualization(
             frame, points_3d, lane_mask, vehicles, pedestrians, signs)
+
+        # Update 3D visualization with lane guidance
+        if depth_map is not None:
+            self.depth_estimator.update_visualization(frame, depth_map, detected_objects, lane_info)
+
+        # Show depth map
+        if colored_depth is not None:
+            cv2.imshow("Depth Map", colored_depth)
 
         # Create info view
         info_frame = frame.copy()
 
         # Draw all detections in info view
-        for obj in vehicles + pedestrians + signs:
+        for obj in detected_objects:
             bbox = obj['bbox']
             cv2.rectangle(info_frame,
                           (int(bbox[0]), int(bbox[1])),
@@ -704,3 +736,70 @@ class AutonomousPerception:
         cv2.imshow("Info View", info_frame)
 
         return info_frame
+
+    def extract_lane_info(self, lane_mask: np.ndarray) -> Dict:
+        """Extract lane information for 3D visualization"""
+        lane_info = {}
+        
+        try:
+            if lane_mask is None:
+                return lane_info
+
+            height, width = lane_mask.shape[:2]
+            
+            # Extract lane points using color thresholding
+            green_mask = cv2.inRange(lane_mask, (0, 250, 0), (0, 255, 0))
+            
+            # Find contours of lane markings
+            contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if len(contours) >= 2:
+                # Sort contours by x-position to separate left and right lanes
+                leftmost_contours = []
+                rightmost_contours = []
+                
+                for contour in contours:
+                    x = np.mean(contour[:, 0, 0])
+                    if x < width/2:
+                        leftmost_contours.append(contour)
+                    else:
+                        rightmost_contours.append(contour)
+                
+                # Process left lane
+                if leftmost_contours:
+                    left_points = np.concatenate(leftmost_contours)
+                    left_points = left_points.reshape(-1, 2)
+                    # Fit polynomial to smooth the lane
+                    left_z = np.polyfit(left_points[:, 1], left_points[:, 0], 2)
+                    left_y = np.linspace(height//2, height-1, 20)
+                    left_x = np.polyval(left_z, left_y)
+                    lane_info['left_lane'] = np.column_stack((left_x, left_y)).astype(np.int32)
+                
+                # Process right lane
+                if rightmost_contours:
+                    right_points = np.concatenate(rightmost_contours)
+                    right_points = right_points.reshape(-1, 2)
+                    # Fit polynomial to smooth the lane
+                    right_z = np.polyfit(right_points[:, 1], right_points[:, 0], 2)
+                    right_y = np.linspace(height//2, height-1, 20)
+                    right_x = np.polyval(right_z, right_y)
+                    lane_info['right_lane'] = np.column_stack((right_x, right_y)).astype(np.int32)
+                
+                # Create driving corridor
+                if 'left_lane' in lane_info and 'right_lane' in lane_info:
+                    left_lane = lane_info['left_lane']
+                    right_lane = lane_info['right_lane']
+                    
+                    # Create corridor points
+                    corridor_points = np.vstack((
+                        left_lane,
+                        right_lane[::-1],
+                        left_lane[0]  # Close the polygon
+                    ))
+                    
+                    lane_info['corridor'] = corridor_points
+        
+        except Exception as e:
+            print(f"Warning: Lane info extraction failed: {str(e)}")
+        
+        return lane_info

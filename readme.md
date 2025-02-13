@@ -34,3 +34,27 @@ SRASU implementations for spatial reconstruction and scene understanding, specif
 ## Contact
 
 For questions and contributions, please open an issue in the repository.
+
+Command to run the code:
+
+for dataset:
+python -m src.main --kitti_path "C:\Users\nisch\OneDrive\Desktop\Srasu\Srasu\kitti_dataset"
+
+for live video:
+python -m src.main --use_camera
+
+python -m src.main --kitti_path "C:\Users\nisch\OneDrive\Desktop\Srasu\Srasu\kitti_dataset"
+
+
+# Run depth estimation with camera (default mode is depth visualization)
+python -m src.depth_main --use_camera
+
+# Run with 3D reconstruction mode
+python -m src.depth_main --use_camera --mode reconstruction
+
+
+# Run depth estimation on KITTI dataset (default mode is depth visualization)
+python -m src.depth_main --kitti_path "path/to/kitti_dataset"
+
+# Run with 3D reconstruction mode
+python -m src.depth_main --kitti_path "path/to/kitti_dataset" --mode reconstruction
